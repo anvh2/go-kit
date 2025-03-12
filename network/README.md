@@ -1,4 +1,4 @@
-# Network under the dog
+# Network under the hood
 
 ## UDP vs. TCP
 
