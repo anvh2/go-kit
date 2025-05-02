@@ -22,21 +22,16 @@ LRU cache:
 	- Use a method to evict the least recently used key when capacity is reached
 **/
 
-type Value struct {
-	value   interface{}
-	element *list.Element
-}
-
 type LRU struct {
 	capacity int32
-	values   map[string]*Value
+	values   map[string]*list.Element
 	elements *list.List
 }
 
 func NewLRU(capacity int32) *LRU {
 	return &LRU{
 		capacity: capacity,
-		values:   make(map[string]*Value),
+		values:   make(map[string]*list.Element),
 		elements: list.New(),
 	}
 }
@@ -44,8 +39,8 @@ func NewLRU(capacity int32) *LRU {
 func (c *LRU) Set(key string, value interface{}) error {
 	exist, ok := c.values[key]
 	if ok {
-		c.elements.MoveToFront(exist.element)
-		c.values[key].value = value
+		c.elements.MoveToFront(exist)
+		c.values[key].Value = value
 		return nil
 	}
 
@@ -56,10 +51,7 @@ func (c *LRU) Set(key string, value interface{}) error {
 	}
 
 	ele := c.elements.PushBack(key)
-	c.values[key] = &Value{
-		value:   value,
-		element: ele,
-	}
+	c.values[key] = ele
 	return nil
 }
 
