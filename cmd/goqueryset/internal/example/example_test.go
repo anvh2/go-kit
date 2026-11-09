@@ -2,6 +2,7 @@ package example
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -115,4 +116,72 @@ func TestSchemaNames(t *testing.T) {
 		t.Fatalf("schema = %+v", PlotDBSchema)
 	}
 	_ = time.Now
+}
+
+// capture records the SQL of every statement the database would run.
+func capture(t *testing.T) (*gorm.DB, *[]string) {
+	t.Helper()
+	db := dryRun(t)
+	var sqls []string
+	record := func(tx *gorm.DB) { sqls = append(sqls, tx.Statement.SQL.String()) }
+	for name, register := range map[string]func(string, func(*gorm.DB)) error{
+		"query": func(n string, f func(*gorm.DB)) error {
+			return db.Callback().Query().After("gorm:query").Register(n, f)
+		},
+		"row": func(n string, f func(*gorm.DB)) error { return db.Callback().Row().After("gorm:row").Register(n, f) },
+	} {
+		if err := register("capture:"+name, record); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return db, &sqls
+}
+
+func TestQuerySetCanBeReusedAfterTerminalCalls(t *testing.T) {
+	db, sqls := capture(t)
+	base := NewPlotQuerySet(db).FarmIDEq(1)
+
+	var one Plot
+	_ = base.One(&one)
+	var all []Plot
+	if err := base.All(&all); err != nil {
+		t.Fatalf("All after One: %v", err)
+	}
+	if _, err := base.Count(); err != nil {
+		t.Fatalf("Count after One: %v", err)
+	}
+	if got := *sqls; len(got) != 3 {
+		t.Fatalf("captured %d statements, want 3: %q", len(got), got)
+	}
+	if first := (*sqls)[0]; !strings.Contains(first, "ORDER BY `plots`.`id` LIMIT") {
+		t.Fatalf("One = %s, want ORDER BY id LIMIT", first)
+	}
+	for _, later := range (*sqls)[1:] {
+		if strings.Contains(later, "LIMIT") || strings.Contains(later, "ORDER BY") {
+			t.Fatalf("One leaked into the query set: %s", later)
+		}
+	}
+}
+
+func TestCountIgnoresPaging(t *testing.T) {
+	db, sqls := capture(t)
+	if _, err := NewPlotQuerySet(db).FarmIDEq(1).OrderAscByCode().Limit(10).Offset(20).Count(); err != nil {
+		t.Fatal(err)
+	}
+	got := (*sqls)[0]
+	if strings.Contains(got, "LIMIT") || strings.Contains(got, "OFFSET") {
+		t.Fatalf("Count kept paging, which makes it return no row: %s", got)
+	}
+}
+
+func TestUpdatersBranchWithoutSharingColumns(t *testing.T) {
+	base := NewPlotQuerySet(dryRun(t)).IDEq(1).GetUpdater()
+	_ = base.SetCode("a")
+	b := base.SetStage("growing")
+	if _, leaked := b.fields["code"]; leaked {
+		t.Fatalf("a sibling updater leaked its column: %v", b.fields)
+	}
+	if len(base.fields) != 0 {
+		t.Fatalf("the base updater changed: %v", base.fields)
+	}
 }

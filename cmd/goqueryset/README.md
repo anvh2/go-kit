@@ -45,5 +45,16 @@ Not columns, so skipped: unexported fields, embedded fields, `gorm:"-"`, relatio
 `gorm:"column:..."`, otherwise GORM's default naming. The source file is read syntactically, so generation works
 before the package compiles; a field type from another package needs its import in the same file.
 
+Other things to know:
+
+- `Count()` ignores `Limit`, `Offset` and ordering. `Delete()` and the updater ignore `Limit`/`Offset` too, so
+  `Limit(1).Delete()` deletes every matching row.
+- `FieldEq(nil)` on a pointer, and `Eq` of a zero `sql.Null*` value, compile to `IS NULL`.
+- Generic types (`sql.Null[T]`) and arrays are not recognised as columns and are skipped.
+- A model whose generated methods would collide (`Status` + `StatusNot` both want `StatusNotIn`; a field or method
+  named `Create`/`Delete`/`Update`) is rejected with an error instead of generating code that does not compile.
+- A field type from a package named `errors`, `gorm` or `clause` other than the standard/GORM ones is rejected: the
+  generated file imports those names itself.
+
 Differences from the original `go-queryset`: GORM v2 only, `NotLike` (not `Notlike`), copy-on-chain, and no
 `DeleteNumUnscoped`.

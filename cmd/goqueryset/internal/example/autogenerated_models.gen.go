@@ -45,8 +45,8 @@ func (qs PlotQuerySet) order(name string, desc bool) PlotQuerySet {
 	return PlotQuerySet{db: qs.next().Order(clause.OrderByColumn{Column: qs.col(name), Desc: desc})}
 }
 
-// GetDB returns the underlying query for what the query set does not cover (joins, preloads, locking).
-func (qs PlotQuerySet) GetDB() *gorm.DB { return qs.db }
+// GetDB returns a copy of the underlying query for what the query set does not cover (joins, preloads, locking).
+func (qs PlotQuerySet) GetDB() *gorm.DB { return qs.next() }
 
 // Select restricts the columns read.
 func (qs PlotQuerySet) Select(fields ...PlotDBSchemaField) PlotQuerySet {
@@ -64,19 +64,20 @@ func (qs PlotQuerySet) Limit(n int) PlotQuerySet { return PlotQuerySet{db: qs.ne
 func (qs PlotQuerySet) Offset(n int) PlotQuerySet { return PlotQuerySet{db: qs.next().Offset(n)} }
 
 // All reads every matching row into ret.
-func (qs PlotQuerySet) All(ret *[]Plot) error { return qs.db.Find(ret).Error }
+func (qs PlotQuerySet) All(ret *[]Plot) error { return qs.next().Find(ret).Error }
 
 // One reads the first matching row (by primary key) into ret; gorm.ErrRecordNotFound when there is none.
-func (qs PlotQuerySet) One(ret *Plot) error { return qs.db.First(ret).Error }
+func (qs PlotQuerySet) One(ret *Plot) error { return qs.next().First(ret).Error }
 
-// Count counts the matching rows.
+// Count counts the matching rows, ignoring Limit, Offset and ordering.
 func (qs PlotQuerySet) Count() (int64, error) {
 	var n int64
-	err := qs.next().Count(&n).Error
+	err := qs.next().Limit(-1).Offset(-1).Count(&n).Error
 	return n, err
 }
 
-// Delete deletes the matching rows. A query set without conditions is refused (gorm.ErrMissingWhereClause).
+// Delete deletes the matching rows; Limit and Offset are ignored. A query set without conditions is refused
+// (gorm.ErrMissingWhereClause).
 func (qs PlotQuerySet) Delete() error { return qs.next().Delete(&Plot{}).Error }
 
 // DeleteNum deletes the matching rows and returns how many were deleted.
@@ -85,7 +86,7 @@ func (qs PlotQuerySet) DeleteNum() (int64, error) {
 	return res.RowsAffected, res.Error
 }
 
-// GetUpdater starts an update of the matching rows.
+// GetUpdater starts an update of the matching rows; Limit and Offset are ignored.
 func (qs PlotQuerySet) GetUpdater() PlotUpdater {
 	return PlotUpdater{fields: map[string]interface{}{}, db: qs.next()}
 }
@@ -553,56 +554,57 @@ func NewPlotUpdater(db *gorm.DB) PlotUpdater {
 
 // SetID sets id.
 func (u PlotUpdater) SetID(value uint64) PlotUpdater {
-	u.fields[string(PlotDBSchema.ID)] = value
-	return u
+	return u.with(PlotDBSchema.ID, value)
 }
 
 // SetFarmID sets farm_id.
 func (u PlotUpdater) SetFarmID(value uint64) PlotUpdater {
-	u.fields[string(PlotDBSchema.FarmID)] = value
-	return u
+	return u.with(PlotDBSchema.FarmID, value)
 }
 
 // SetCode sets code.
 func (u PlotUpdater) SetCode(value string) PlotUpdater {
-	u.fields[string(PlotDBSchema.Code)] = value
-	return u
+	return u.with(PlotDBSchema.Code, value)
 }
 
 // SetStage sets stage.
 func (u PlotUpdater) SetStage(value Stage) PlotUpdater {
-	u.fields[string(PlotDBSchema.Stage)] = value
-	return u
+	return u.with(PlotDBSchema.Stage, value)
 }
 
 // SetAreaM2 sets area_m2.
 func (u PlotUpdater) SetAreaM2(value float64) PlotUpdater {
-	u.fields[string(PlotDBSchema.AreaM2)] = value
-	return u
+	return u.with(PlotDBSchema.AreaM2, value)
 }
 
 // SetActive sets active.
 func (u PlotUpdater) SetActive(value bool) PlotUpdater {
-	u.fields[string(PlotDBSchema.Active)] = value
-	return u
+	return u.with(PlotDBSchema.Active, value)
 }
 
 // SetRetiredAt sets retired_at.
 func (u PlotUpdater) SetRetiredAt(value *time.Time) PlotUpdater {
-	u.fields[string(PlotDBSchema.RetiredAt)] = value
-	return u
+	return u.with(PlotDBSchema.RetiredAt, value)
 }
 
 // SetNote sets note.
 func (u PlotUpdater) SetNote(value sql.NullString) PlotUpdater {
-	u.fields[string(PlotDBSchema.Note)] = value
-	return u
+	return u.with(PlotDBSchema.Note, value)
 }
 
 // SetCreatedAt sets created_at.
 func (u PlotUpdater) SetCreatedAt(value time.Time) PlotUpdater {
-	u.fields[string(PlotDBSchema.CreatedAt)] = value
-	return u
+	return u.with(PlotDBSchema.CreatedAt, value)
+}
+
+// with returns a copy of u with one more column set, so an updater can be the base of several updates.
+func (u PlotUpdater) with(f PlotDBSchemaField, value interface{}) PlotUpdater {
+	fields := make(map[string]interface{}, len(u.fields)+1)
+	for k, v := range u.fields {
+		fields[k] = v
+	}
+	fields[string(f)] = value
+	return PlotUpdater{fields: fields, db: u.db}
 }
 
 // Update writes the set columns. An update without conditions is refused (gorm.ErrMissingWhereClause).
@@ -694,8 +696,8 @@ func (qs PlantingQuerySet) order(name string, desc bool) PlantingQuerySet {
 	return PlantingQuerySet{db: qs.next().Order(clause.OrderByColumn{Column: qs.col(name), Desc: desc})}
 }
 
-// GetDB returns the underlying query for what the query set does not cover (joins, preloads, locking).
-func (qs PlantingQuerySet) GetDB() *gorm.DB { return qs.db }
+// GetDB returns a copy of the underlying query for what the query set does not cover (joins, preloads, locking).
+func (qs PlantingQuerySet) GetDB() *gorm.DB { return qs.next() }
 
 // Select restricts the columns read.
 func (qs PlantingQuerySet) Select(fields ...PlantingDBSchemaField) PlantingQuerySet {
@@ -717,19 +719,20 @@ func (qs PlantingQuerySet) Offset(n int) PlantingQuerySet {
 }
 
 // All reads every matching row into ret.
-func (qs PlantingQuerySet) All(ret *[]Planting) error { return qs.db.Find(ret).Error }
+func (qs PlantingQuerySet) All(ret *[]Planting) error { return qs.next().Find(ret).Error }
 
 // One reads the first matching row (by primary key) into ret; gorm.ErrRecordNotFound when there is none.
-func (qs PlantingQuerySet) One(ret *Planting) error { return qs.db.First(ret).Error }
+func (qs PlantingQuerySet) One(ret *Planting) error { return qs.next().First(ret).Error }
 
-// Count counts the matching rows.
+// Count counts the matching rows, ignoring Limit, Offset and ordering.
 func (qs PlantingQuerySet) Count() (int64, error) {
 	var n int64
-	err := qs.next().Count(&n).Error
+	err := qs.next().Limit(-1).Offset(-1).Count(&n).Error
 	return n, err
 }
 
-// Delete deletes the matching rows. A query set without conditions is refused (gorm.ErrMissingWhereClause).
+// Delete deletes the matching rows; Limit and Offset are ignored. A query set without conditions is refused
+// (gorm.ErrMissingWhereClause).
 func (qs PlantingQuerySet) Delete() error { return qs.next().Delete(&Planting{}).Error }
 
 // DeleteNum deletes the matching rows and returns how many were deleted.
@@ -738,7 +741,7 @@ func (qs PlantingQuerySet) DeleteNum() (int64, error) {
 	return res.RowsAffected, res.Error
 }
 
-// GetUpdater starts an update of the matching rows.
+// GetUpdater starts an update of the matching rows; Limit and Offset are ignored.
 func (qs PlantingQuerySet) GetUpdater() PlantingUpdater {
 	return PlantingUpdater{fields: map[string]interface{}{}, db: qs.next()}
 }
@@ -946,20 +949,27 @@ func NewPlantingUpdater(db *gorm.DB) PlantingUpdater {
 
 // SetID sets id.
 func (u PlantingUpdater) SetID(value uint64) PlantingUpdater {
-	u.fields[string(PlantingDBSchema.ID)] = value
-	return u
+	return u.with(PlantingDBSchema.ID, value)
 }
 
 // SetPlotID sets plot_id.
 func (u PlantingUpdater) SetPlotID(value uint64) PlantingUpdater {
-	u.fields[string(PlantingDBSchema.PlotID)] = value
-	return u
+	return u.with(PlantingDBSchema.PlotID, value)
 }
 
 // SetCrop sets crop.
 func (u PlantingUpdater) SetCrop(value string) PlantingUpdater {
-	u.fields[string(PlantingDBSchema.Crop)] = value
-	return u
+	return u.with(PlantingDBSchema.Crop, value)
+}
+
+// with returns a copy of u with one more column set, so an updater can be the base of several updates.
+func (u PlantingUpdater) with(f PlantingDBSchemaField, value interface{}) PlantingUpdater {
+	fields := make(map[string]interface{}, len(u.fields)+1)
+	for k, v := range u.fields {
+		fields[k] = v
+	}
+	fields[string(f)] = value
+	return PlantingUpdater{fields: fields, db: u.db}
 }
 
 // Update writes the set columns. An update without conditions is refused (gorm.ErrMissingWhereClause).

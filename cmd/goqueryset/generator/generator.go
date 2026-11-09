@@ -71,8 +71,8 @@ func (qs {{$m}}QuerySet) order(name string, desc bool) {{$m}}QuerySet {
 	return {{$m}}QuerySet{db: qs.next().Order(clause.OrderByColumn{Column: qs.col(name), Desc: desc})}
 }
 
-// GetDB returns the underlying query for what the query set does not cover (joins, preloads, locking).
-func (qs {{$m}}QuerySet) GetDB() *gorm.DB { return qs.db }
+// GetDB returns a copy of the underlying query for what the query set does not cover (joins, preloads, locking).
+func (qs {{$m}}QuerySet) GetDB() *gorm.DB { return qs.next() }
 
 // Select restricts the columns read.
 func (qs {{$m}}QuerySet) Select(fields ...{{$m}}DBSchemaField) {{$m}}QuerySet {
@@ -90,19 +90,20 @@ func (qs {{$m}}QuerySet) Limit(n int) {{$m}}QuerySet { return {{$m}}QuerySet{db:
 func (qs {{$m}}QuerySet) Offset(n int) {{$m}}QuerySet { return {{$m}}QuerySet{db: qs.next().Offset(n)} }
 
 // All reads every matching row into ret.
-func (qs {{$m}}QuerySet) All(ret *[]{{$m}}) error { return qs.db.Find(ret).Error }
+func (qs {{$m}}QuerySet) All(ret *[]{{$m}}) error { return qs.next().Find(ret).Error }
 
 // One reads the first matching row (by primary key) into ret; gorm.ErrRecordNotFound when there is none.
-func (qs {{$m}}QuerySet) One(ret *{{$m}}) error { return qs.db.First(ret).Error }
+func (qs {{$m}}QuerySet) One(ret *{{$m}}) error { return qs.next().First(ret).Error }
 
-// Count counts the matching rows.
+// Count counts the matching rows, ignoring Limit, Offset and ordering.
 func (qs {{$m}}QuerySet) Count() (int64, error) {
 	var n int64
-	err := qs.next().Count(&n).Error
+	err := qs.next().Limit(-1).Offset(-1).Count(&n).Error
 	return n, err
 }
 
-// Delete deletes the matching rows. A query set without conditions is refused (gorm.ErrMissingWhereClause).
+// Delete deletes the matching rows; Limit and Offset are ignored. A query set without conditions is refused
+// (gorm.ErrMissingWhereClause).
 func (qs {{$m}}QuerySet) Delete() error { return qs.next().Delete(&{{$m}}{}).Error }
 
 // DeleteNum deletes the matching rows and returns how many were deleted.
@@ -111,19 +112,19 @@ func (qs {{$m}}QuerySet) DeleteNum() (int64, error) {
 	return res.RowsAffected, res.Error
 }
 
-// GetUpdater starts an update of the matching rows.
+// GetUpdater starts an update of the matching rows; Limit and Offset are ignored.
 func (qs {{$m}}QuerySet) GetUpdater() {{$m}}Updater {
 	return {{$m}}Updater{fields: map[string]interface{}{}, db: qs.next()}
 }
 {{range .Fields}}
 // {{.Name}}Eq keeps rows whose {{.Column}} equals value.
 func (qs {{$m}}QuerySet) {{.Name}}Eq(value {{.Type}}) {{$m}}QuerySet {
-	return qs.where(clause.Eq{Column: qs.col("{{.Column}}"), Value: value})
+	return qs.where(clause.Eq{Column: qs.col({{printf "%q" .Column}}), Value: value})
 }
 
 // {{.Name}}Ne keeps rows whose {{.Column}} differs from value.
 func (qs {{$m}}QuerySet) {{.Name}}Ne(value {{.Type}}) {{$m}}QuerySet {
-	return qs.where(clause.Neq{Column: qs.col("{{.Column}}"), Value: value})
+	return qs.where(clause.Neq{Column: qs.col({{printf "%q" .Column}}), Value: value})
 }
 {{if .HasIn}}
 // {{.Name}}In keeps rows whose {{.Column}} is one of values (at least one is required).
@@ -135,7 +136,7 @@ func (qs {{$m}}QuerySet) {{.Name}}In(values ...{{.Type}}) {{$m}}QuerySet {
 	for i, v := range values {
 		vals[i] = v
 	}
-	return qs.where(clause.IN{Column: qs.col("{{.Column}}"), Values: vals})
+	return qs.where(clause.IN{Column: qs.col({{printf "%q" .Column}}), Values: vals})
 }
 
 // {{.Name}}NotIn keeps rows whose {{.Column}} is none of values (at least one is required).
@@ -147,54 +148,54 @@ func (qs {{$m}}QuerySet) {{.Name}}NotIn(values ...{{.Type}}) {{$m}}QuerySet {
 	for i, v := range values {
 		vals[i] = v
 	}
-	return qs.where(clause.Not(clause.IN{Column: qs.col("{{.Column}}"), Values: vals}))
+	return qs.where(clause.Not(clause.IN{Column: qs.col({{printf "%q" .Column}}), Values: vals}))
 }
 {{end}}{{if .HasCompare}}
 // {{.Name}}Gt keeps rows whose {{.Column}} is greater than value.
 func (qs {{$m}}QuerySet) {{.Name}}Gt(value {{.Type}}) {{$m}}QuerySet {
-	return qs.where(clause.Gt{Column: qs.col("{{.Column}}"), Value: value})
+	return qs.where(clause.Gt{Column: qs.col({{printf "%q" .Column}}), Value: value})
 }
 
 // {{.Name}}Gte keeps rows whose {{.Column}} is greater than or equal to value.
 func (qs {{$m}}QuerySet) {{.Name}}Gte(value {{.Type}}) {{$m}}QuerySet {
-	return qs.where(clause.Gte{Column: qs.col("{{.Column}}"), Value: value})
+	return qs.where(clause.Gte{Column: qs.col({{printf "%q" .Column}}), Value: value})
 }
 
 // {{.Name}}Lt keeps rows whose {{.Column}} is less than value.
 func (qs {{$m}}QuerySet) {{.Name}}Lt(value {{.Type}}) {{$m}}QuerySet {
-	return qs.where(clause.Lt{Column: qs.col("{{.Column}}"), Value: value})
+	return qs.where(clause.Lt{Column: qs.col({{printf "%q" .Column}}), Value: value})
 }
 
 // {{.Name}}Lte keeps rows whose {{.Column}} is less than or equal to value.
 func (qs {{$m}}QuerySet) {{.Name}}Lte(value {{.Type}}) {{$m}}QuerySet {
-	return qs.where(clause.Lte{Column: qs.col("{{.Column}}"), Value: value})
+	return qs.where(clause.Lte{Column: qs.col({{printf "%q" .Column}}), Value: value})
 }
 {{end}}{{if .HasLike}}
 // {{.Name}}Like keeps rows whose {{.Column}} matches the SQL LIKE pattern.
 func (qs {{$m}}QuerySet) {{.Name}}Like(pattern {{.Type}}) {{$m}}QuerySet {
-	return qs.where(clause.Like{Column: qs.col("{{.Column}}"), Value: pattern})
+	return qs.where(clause.Like{Column: qs.col({{printf "%q" .Column}}), Value: pattern})
 }
 
 // {{.Name}}NotLike keeps rows whose {{.Column}} does not match the SQL LIKE pattern.
 func (qs {{$m}}QuerySet) {{.Name}}NotLike(pattern {{.Type}}) {{$m}}QuerySet {
-	return qs.where(clause.Not(clause.Like{Column: qs.col("{{.Column}}"), Value: pattern}))
+	return qs.where(clause.Not(clause.Like{Column: qs.col({{printf "%q" .Column}}), Value: pattern}))
 }
 {{end}}{{if .HasNull}}
 // {{.Name}}IsNull keeps rows whose {{.Column}} is NULL.
 func (qs {{$m}}QuerySet) {{.Name}}IsNull() {{$m}}QuerySet {
-	return qs.where(clause.Eq{Column: qs.col("{{.Column}}"), Value: nil})
+	return qs.where(clause.Eq{Column: qs.col({{printf "%q" .Column}}), Value: nil})
 }
 
 // {{.Name}}IsNotNull keeps rows whose {{.Column}} is not NULL.
 func (qs {{$m}}QuerySet) {{.Name}}IsNotNull() {{$m}}QuerySet {
-	return qs.where(clause.Neq{Column: qs.col("{{.Column}}"), Value: nil})
+	return qs.where(clause.Neq{Column: qs.col({{printf "%q" .Column}}), Value: nil})
 }
 {{end}}{{if .Orderable}}
 // OrderAscBy{{.Name}} sorts by {{.Column}}, ascending.
-func (qs {{$m}}QuerySet) OrderAscBy{{.Name}}() {{$m}}QuerySet { return qs.order("{{.Column}}", false) }
+func (qs {{$m}}QuerySet) OrderAscBy{{.Name}}() {{$m}}QuerySet { return qs.order({{printf "%q" .Column}}, false) }
 
 // OrderDescBy{{.Name}} sorts by {{.Column}}, descending.
-func (qs {{$m}}QuerySet) OrderDescBy{{.Name}}() {{$m}}QuerySet { return qs.order("{{.Column}}", true) }
+func (qs {{$m}}QuerySet) OrderDescBy{{.Name}}() {{$m}}QuerySet { return qs.order({{printf "%q" .Column}}, true) }
 {{end}}{{end}}
 // {{$m}}Updater sets columns of the rows its query set matched.
 type {{$m}}Updater struct {
@@ -209,10 +210,19 @@ func New{{$m}}Updater(db *gorm.DB) {{$m}}Updater {
 {{range .Fields}}
 // Set{{.Name}} sets {{.Column}}.
 func (u {{$m}}Updater) Set{{.Name}}(value {{.Type}}) {{$m}}Updater {
-	u.fields[string({{$m}}DBSchema.{{.Name}})] = value
-	return u
+	return u.with({{$m}}DBSchema.{{.Name}}, value)
 }
 {{end}}
+// with returns a copy of u with one more column set, so an updater can be the base of several updates.
+func (u {{$m}}Updater) with(f {{$m}}DBSchemaField, value interface{}) {{$m}}Updater {
+	fields := make(map[string]interface{}, len(u.fields)+1)
+	for k, v := range u.fields {
+		fields[k] = v
+	}
+	fields[string(f)] = value
+	return {{$m}}Updater{fields: fields, db: u.db}
+}
+
 // Update writes the set columns. An update without conditions is refused (gorm.ErrMissingWhereClause).
 func (u {{$m}}Updater) Update() error { return u.db.Updates(u.fields).Error }
 
@@ -249,6 +259,6 @@ func (f {{$m}}DBSchemaField) String() string { return string(f) }
 var {{$m}}DBSchema = struct {
 {{range .Fields}}	{{.Name}} {{$m}}DBSchemaField
 {{end}}}{
-{{range .Fields}}	{{.Name}}: {{$m}}DBSchemaField("{{.Column}}"),
+{{range .Fields}}	{{.Name}}: {{$m}}DBSchemaField({{printf "%q" .Column}}),
 {{end}}}
 {{end}}`))

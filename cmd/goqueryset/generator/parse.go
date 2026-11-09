@@ -118,11 +118,11 @@ func parse(filename string, src []byte) (*file, error) {
 					continue // relations, slices, maps and other non-column types
 				}
 				typ := types.ExprString(fl.Type)
-				collectPackages(fl.Type, usedPkgs)
 				for _, name := range fl.Names {
 					if !name.IsExported() {
 						continue
 					}
+					collectPackages(fl.Type, usedPkgs)
 					col := column
 					if col == "" {
 						col = naming.ColumnName("", name.Name)
@@ -132,6 +132,9 @@ func parse(filename string, src []byte) (*file, error) {
 			}
 			if len(m.Fields) == 0 {
 				return nil, fmt.Errorf("%s: %s has no column fields", fset.Position(ts.Pos()), ts.Name.Name)
+			}
+			if err := checkNames(m, methodsOf(f, m.Name)); err != nil {
+				return nil, fmt.Errorf("%s: %w", fset.Position(ts.Pos()), err)
 			}
 			out.Models = append(out.Models, m)
 		}
@@ -241,6 +244,20 @@ func resolveImports(f *ast.File, used map[string]bool) ([]string, error) {
 	var lines []string
 	for name := range used {
 		line := ""
+		if reserved, isReserved := reservedImports[name]; isReserved {
+			// The generated file imports these itself; a different package under the same name cannot coexist.
+			for _, spec := range f.Imports {
+				p := strings.Trim(spec.Path.Value, `"`)
+				n := defaultName(p)
+				if spec.Name != nil {
+					n = spec.Name.Name
+				}
+				if n == name && p != reserved {
+					return nil, fmt.Errorf("package %q (%s) clashes with the %s import of the generated code; give it another name", name, p, reserved)
+				}
+			}
+			continue
+		}
 		for _, spec := range f.Imports {
 			p := strings.Trim(spec.Path.Value, `"`)
 			if spec.Name != nil {
@@ -262,6 +279,9 @@ func resolveImports(f *ast.File, used map[string]bool) ([]string, error) {
 	return lines, nil
 }
 
+// reservedImports are the packages the generated file always imports, by the name it uses for them.
+var reservedImports = map[string]string{"errors": "errors", "gorm": "gorm.io/gorm", "clause": "gorm.io/gorm/clause"}
+
 // defaultName is the conventional package name of an import path: its last element without a major-version suffix
 // or a "go-" prefix.
 func defaultName(importPath string) string {
@@ -274,4 +294,84 @@ func defaultName(importPath string) string {
 		base = base[:i]
 	}
 	return strings.ReplaceAll(base, "-", "_")
+}
+
+// methodsOf lists the methods declared on the model in the source file.
+func methodsOf(f *ast.File, model string) map[string]bool {
+	out := map[string]bool{}
+	for _, decl := range f.Decls {
+		fd, ok := decl.(*ast.FuncDecl)
+		if !ok || fd.Recv == nil || len(fd.Recv.List) != 1 {
+			continue
+		}
+		t := fd.Recv.List[0].Type
+		if star, ok := t.(*ast.StarExpr); ok {
+			t = star.X
+		}
+		if id, ok := t.(*ast.Ident); ok && id.Name == model {
+			out[fd.Name.Name] = true
+		}
+	}
+	return out
+}
+
+// checkNames refuses models whose generated identifiers would collide with each other, with the model's fields, or
+// with its own methods, instead of emitting code that does not compile.
+func checkNames(m model, userMethods map[string]bool) error {
+	// Methods on the query set.
+	qs := map[string]string{}
+	add := func(set map[string]string, name, from string) error {
+		if prev, dup := set[name]; dup {
+			return fmt.Errorf("%s: generated method %s from %s collides with %s", m.Name, name, from, prev)
+		}
+		set[name] = from
+		return nil
+	}
+	for _, n := range []string{"GetDB", "Select", "Limit", "Offset", "All", "One", "Count", "Delete", "DeleteNum", "GetUpdater"} {
+		qs[n] = "the fixed query set methods"
+	}
+	up := map[string]string{"Update": "the fixed updater methods", "UpdateNum": "the fixed updater methods"}
+	for _, f := range m.Fields {
+		names := []string{"Eq", "Ne"}
+		if f.HasIn() {
+			names = append(names, "In", "NotIn")
+		}
+		if f.HasCompare() {
+			names = append(names, "Gt", "Gte", "Lt", "Lte")
+		}
+		if f.HasLike() {
+			names = append(names, "Like", "NotLike")
+		}
+		if f.HasNull() {
+			names = append(names, "IsNull", "IsNotNull")
+		}
+		for _, suffix := range names {
+			if err := add(qs, f.Name+suffix, "field "+f.Name); err != nil {
+				return err
+			}
+		}
+		if f.Orderable {
+			for _, prefix := range []string{"OrderAscBy", "OrderDescBy"} {
+				if err := add(qs, prefix+f.Name, "field "+f.Name); err != nil {
+					return err
+				}
+			}
+		}
+		if err := add(up, "Set"+f.Name, "field "+f.Name); err != nil {
+			return err
+		}
+	}
+	// Methods on the model itself: generated Create/Delete/Update, the user's own, and its fields share one namespace.
+	own := map[string]string{"Create": "the generated model methods", "Delete": "the generated model methods", "Update": "the generated model methods"}
+	for name := range userMethods {
+		if prev, dup := own[name]; dup {
+			return fmt.Errorf("%s: method %s collides with %s", m.Name, name, prev)
+		}
+	}
+	for _, f := range m.Fields {
+		if prev, dup := own[f.Name]; dup {
+			return fmt.Errorf("%s: field %s collides with %s", m.Name, f.Name, prev)
+		}
+	}
+	return nil
 }

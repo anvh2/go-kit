@@ -2,6 +2,8 @@ package generator
 
 import (
 	"bytes"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"strings"
@@ -47,6 +49,8 @@ func TestImportsAndColumns(t *testing.T) {
 	src := `package p
 
 import (
+	"go/parser"
+	"go/token"
 	"time"
 	dt "gorm.io/datatypes"
 	"github.com/google/uuid"
@@ -74,5 +78,86 @@ type A struct {
 	}
 	if bytes.Contains(out, []byte("func (qs AQuerySet) MetaGt(")) {
 		t.Error("an opaque type must not get comparison methods")
+	}
+}
+
+func TestGormTypesAndUnexportedFieldImports(t *testing.T) {
+	src := `package p
+
+import (
+	"go/parser"
+	"go/token"
+	"net/netip"
+	"gorm.io/gorm"
+)
+
+// gen:qs
+type A struct {
+	ID        uint64
+	DeletedAt gorm.DeletedAt
+	addr      netip.Addr
+}
+`
+	out, err := Generate("p.go", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := parser.ParseFile(token.NewFileSet(), "gen.go", out, parser.ImportsOnly)
+	if err != nil {
+		t.Fatalf("generated file does not parse: %v", err)
+	}
+	seen := map[string]bool{}
+	for _, imp := range f.Imports {
+		if seen[imp.Path.Value] {
+			t.Errorf("import %s appears twice", imp.Path.Value)
+		}
+		seen[imp.Path.Value] = true
+	}
+	if seen[`"net/netip"`] {
+		t.Error("the import of an unexported field's package is unused and breaks compilation")
+	}
+}
+
+func TestReservedImportNameClash(t *testing.T) {
+	src := `package p
+
+import "example.com/other/gorm"
+
+// gen:qs
+type A struct{ ID gorm.Thing }
+`
+	if _, err := Generate("p.go", []byte(src)); err == nil || !strings.Contains(err.Error(), "clashes") {
+		t.Fatalf("err = %v, want a clash with the generated gorm import", err)
+	}
+}
+
+func TestNameCollisionsAreErrors(t *testing.T) {
+	cases := map[string]string{
+		"field names that generate the same method": "package p\n// gen:qs\ntype A struct{ Status string; StatusNot string }\n",
+		"field named like a generated model method": "package p\n// gen:qs\ntype A struct{ ID int; Create string }\n",
+		"user method named like a generated one":    "package p\n// gen:qs\ntype A struct{ ID int }\nfunc (a *A) Update() {}\n",
+		"field named like a fixed query set method": "package p\n// gen:qs\ntype A struct{ ID int; Count string }\n",
+	}
+	// The last case is legal: CountEq and CountNe do not collide with Count.
+	for name, src := range cases {
+		_, err := Generate("p.go", []byte(src))
+		legal := name == "field named like a fixed query set method"
+		if legal && err != nil {
+			t.Errorf("%s: unexpected error %v", name, err)
+		}
+		if !legal && (err == nil || !strings.Contains(err.Error(), "collide")) {
+			t.Errorf("%s: err = %v, want a collision error", name, err)
+		}
+	}
+}
+
+func TestColumnNamesAreQuoted(t *testing.T) {
+	src := "package p\n// gen:qs\ntype A struct{ ID int `gorm:\"column:we\\\"ird\"` }\n"
+	out, err := Generate("p.go", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := parser.ParseFile(token.NewFileSet(), "gen.go", out, 0); err != nil {
+		t.Fatalf("a column name with a quote broke the generated file: %v", err)
 	}
 }
