@@ -74,9 +74,15 @@ func (s *Server) Start() error {
 }
 
 // Serve serves gRPC and HTTP (gateway, metrics, debug and custom handlers) on one listener until ctx is cancelled or a
-// server fails. On cancellation both servers shut down gracefully (bounded by shutdownTimeout) and Serve returns nil.
-// The listener is closed when Serve returns. Shutdown hooks are run by Start only.
+// server stops. On cancellation the HTTP server drains first (gateway requests still reach gRPC), then gRPC drains;
+// together they are bounded by shutdownTimeout, after which remaining connections are closed. Serve then returns nil.
+// If a server stops on its own (including because lis was closed by someone else), Serve shuts the other down and
+// returns that error. The listener is closed when Serve returns. Shutdown hooks are run by Start only.
 func (s *Server) Serve(ctx context.Context, lis net.Listener) error {
+	// Cancelled on every return, so the gateway's client connection to the gRPC server is always released.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	grpcServer := s.newGRPCServer()
 	httpServer, err := s.newHTTPServer(ctx, lis.Addr())
 	if err != nil {
@@ -85,36 +91,45 @@ func (s *Server) Serve(ctx context.Context, lis net.Listener) error {
 	}
 
 	m := cmux.New(lis)
+	// Without a read timeout, a connection that never sends its first bytes blocks cmux's protocol sniffing, and
+	// m.Serve (hence shutdown) would wait for it forever.
+	m.SetReadTimeout(s.config.muxReadTimeout)
 	grpcListener := m.MatchWithWriters(cmux.HTTP2MatchHeaderFieldSendSettings("content-type", "application/grpc"))
 	httpListener := m.Match(cmux.HTTP1Fast())
 
 	// Once shutdown has begun, the servers' exit errors are the expected result of closing them, whatever listener
-	// implementation produced them.
+	// implementation produced them. Before that, any exit is unexpected and ends Serve.
 	var shuttingDown atomic.Bool
-	exit := func(err error) error {
-		if shuttingDown.Load() || ignoreClosed(err) == nil {
+	exit := func(name string, err error) error {
+		if shuttingDown.Load() {
 			return nil
 		}
-		return err
+		if err == nil {
+			err = errors.New("stopped")
+		}
+		return fmt.Errorf("server: %s: %w", name, err)
 	}
 
 	g, gctx := errgroup.WithContext(ctx)
-	g.Go(func() error { return exit(grpcServer.Serve(grpcListener)) })
-	g.Go(func() error { return exit(httpServer.Serve(httpListener)) })
-	g.Go(func() error { return exit(m.Serve()) })
+	g.Go(func() error { return exit("grpc", grpcServer.Serve(grpcListener)) })
+	g.Go(func() error { return exit("http", httpServer.Serve(httpListener)) })
+	g.Go(func() error { return exit("mux", m.Serve()) })
 	g.Go(func() error {
 		<-gctx.Done()
 		shuttingDown.Store(true)
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
+		if err := httpServer.Shutdown(shutdownCtx); err != nil {
+			httpServer.Close()
+		}
 		stopped := make(chan struct{})
 		go func() { grpcServer.GracefulStop(); close(stopped) }()
 		select {
 		case <-stopped:
 		case <-shutdownCtx.Done():
 			grpcServer.Stop()
+			<-stopped
 		}
-		_ = httpServer.Shutdown(shutdownCtx)
 		m.Close()
 		return nil
 	})

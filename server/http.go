@@ -20,7 +20,8 @@ const (
 )
 
 // newHTTPServer builds the HTTP server: the grpc-gateway mux (dialing the gRPC server on the listener's own address),
-// metrics and debug endpoints, custom handlers and middlewares.
+// metrics and debug endpoints, custom handlers and middlewares. /metrics and /debug/vars are served without
+// authentication on the same port; /debug/vars includes the process command line, so never pass secrets as flags.
 func (s *Server) newHTTPServer(ctx context.Context, addr net.Addr) (*http.Server, error) {
 	// configure mux options
 	muxOpts := []runtime.ServeMuxOption{

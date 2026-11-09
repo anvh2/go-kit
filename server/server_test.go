@@ -222,3 +222,89 @@ func TestDialAddress(t *testing.T) {
 		}
 	}
 }
+
+func TestStreamInterceptorsRun(t *testing.T) {
+	var mu sync.Mutex
+	var calls []string
+	si := func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		mu.Lock()
+		calls = append(calls, info.FullMethod)
+		mu.Unlock()
+		return handler(srv, ss)
+	}
+	lis := start(t, New(WithGRPCStreamInterceptor(si)).Register(registerHealth, nil))
+
+	conn, err := grpc.NewClient("passthrough:///bufnet", grpc.WithTransportCredentials(insecure.NewCredentials()), dialer(lis))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stream, err := healthpb.NewHealthClient(conn).Watch(ctx, &healthpb.HealthCheckRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stream.Recv(); err != nil {
+		t.Fatalf("Watch Recv: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(calls) != 1 || calls[0] != "/grpc.health.v1.Health/Watch" {
+		t.Fatalf("stream interceptor calls = %q, want one Watch", calls)
+	}
+}
+
+func TestPanicInCallerInterceptorIsRecovered(t *testing.T) {
+	boom := func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		panic("boom")
+	}
+	lis := start(t, New(WithGRPCUnaryInterceptor(boom)).Register(registerHealth, nil))
+
+	for i := 0; i < 2; i++ { // the server survives the first panic
+		if code := status.Code(healthCheck(t, lis)); code != codes.Internal {
+			t.Fatalf("call %d: code = %v, want Internal from the recovery interceptor", i, code)
+		}
+	}
+}
+
+func TestShutdownIsNotBlockedByAnIdleConnection(t *testing.T) {
+	s := New().Register(registerHealth, nil)
+	s.config.muxReadTimeout = 200 * time.Millisecond
+	lis := bufconn.Listen(1 << 20)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.Serve(ctx, lis) }()
+
+	idle, err := lis.Dial() // connects and never sends a byte
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idle.Close()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve returned %v after cancellation", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Serve did not return: an idle connection blocked shutdown")
+	}
+}
+
+func TestServeReturnsWhenTheListenerIsClosedExternally(t *testing.T) {
+	lis := bufconn.Listen(1 << 20)
+	done := make(chan error, 1)
+	go func() { done <- New().Register(registerHealth, nil).Serve(context.Background(), lis) }()
+	time.Sleep(50 * time.Millisecond)
+	lis.Close()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Serve returned nil, want an error for a listener closed outside shutdown")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Serve did not return after its listener was closed")
+	}
+}
