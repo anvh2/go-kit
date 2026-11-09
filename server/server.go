@@ -36,6 +36,9 @@ type HTTPServerMiddleware func(http.Handler) http.Handler
 // shutdownTimeout bounds graceful shutdown of the gRPC and HTTP servers.
 const shutdownTimeout = 10 * time.Second
 
+// stopGrace is how long Serve waits for handlers after forcing gRPC to stop.
+const stopGrace = time.Second
+
 type Server struct {
 	config *Config
 
@@ -74,7 +77,8 @@ func (s *Server) Start() error {
 }
 
 // Serve serves gRPC and HTTP (gateway, metrics, debug and custom handlers) on one listener until ctx is cancelled or a
-// server stops. On cancellation the HTTP server drains first (gateway requests still reach gRPC), then gRPC drains;
+// server stops. On cancellation the HTTP server drains first (a gateway request already in flight still reaches gRPC
+// over its open connection; no new connections are accepted), then gRPC drains;
 // together they are bounded by shutdownTimeout, after which remaining connections are closed. Serve then returns nil.
 // If a server stops on its own (including because lis was closed by someone else), Serve shuts the other down and
 // returns that error. The listener is closed when Serve returns. Shutdown hooks are run by Start only.
@@ -127,19 +131,17 @@ func (s *Server) Serve(ctx context.Context, lis net.Listener) error {
 		select {
 		case <-stopped:
 		case <-shutdownCtx.Done():
+			// Stop closes the connections but GracefulStop still waits for running handlers, and a handler that
+			// ignores its context never returns. Give it a short grace period, then leave it (its goroutine leaks)
+			// rather than keep Serve, and with it the shutdown hooks, from returning.
 			grpcServer.Stop()
-			<-stopped
+			select {
+			case <-stopped:
+			case <-time.After(stopGrace):
+			}
 		}
 		m.Close()
 		return nil
 	})
 	return g.Wait()
-}
-
-// ignoreClosed treats the errors servers return after a deliberate shutdown as a clean exit.
-func ignoreClosed(err error) error {
-	if err == nil || errors.Is(err, http.ErrServerClosed) || errors.Is(err, grpc.ErrServerStopped) || errors.Is(err, cmux.ErrListenerClosed) || errors.Is(err, net.ErrClosed) || errors.Is(err, cmux.ErrServerClosed) {
-		return nil
-	}
-	return err
 }

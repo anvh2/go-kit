@@ -269,8 +269,7 @@ func TestPanicInCallerInterceptorIsRecovered(t *testing.T) {
 }
 
 func TestShutdownIsNotBlockedByAnIdleConnection(t *testing.T) {
-	s := New().Register(registerHealth, nil)
-	s.config.muxReadTimeout = 200 * time.Millisecond
+	s := New(WithMuxReadTimeout(200*time.Millisecond)).Register(registerHealth, nil)
 	lis := bufconn.Listen(1 << 20)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -306,5 +305,47 @@ func TestServeReturnsWhenTheListenerIsClosedExternally(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("Serve did not return after its listener was closed")
+	}
+}
+
+func TestShutdownIsBoundedWhenAHandlerIgnoresItsContext(t *testing.T) {
+	if testing.Short() {
+		t.Skip("waits for the shutdown budget")
+	}
+	release := make(chan struct{})
+	entered := make(chan struct{})
+	defer close(release)
+	block := func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		close(entered)
+		<-release // ignores ctx
+		return handler(ctx, req)
+	}
+	s := New(WithGRPCUnaryInterceptor(block)).Register(registerHealth, nil)
+	lis := bufconn.Listen(1 << 20)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.Serve(ctx, lis) }()
+
+	go func() { // abandoned when the server stops; no t.Fatal off the test goroutine
+		conn, err := grpc.NewClient("passthrough:///bufnet", grpc.WithTransportCredentials(insecure.NewCredentials()), dialer(lis))
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = healthpb.NewHealthClient(conn).Check(context.Background(), &healthpb.HealthCheckRequest{})
+	}()
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("handler never started")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve returned %v", err)
+		}
+	case <-time.After(shutdownTimeout + stopGrace + 3*time.Second):
+		t.Fatal("Serve did not return: a stuck handler blocked shutdown")
 	}
 }

@@ -39,6 +39,14 @@ func evaluateOptions(opts []Option) *Config {
 	return options
 }
 
+// WithMuxReadTimeout bounds how long a new connection may take to send the bytes that identify its protocol
+// (default 5s). Slower clients are dropped.
+func WithMuxReadTimeout(d time.Duration) Option {
+	return func(c *Config) {
+		c.muxReadTimeout = d
+	}
+}
+
 func WithPort(port int) Option {
 	return func(c *Config) {
 		c.port = port
