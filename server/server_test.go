@@ -16,7 +16,11 @@ import (
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/status"
+	"google.golang.org/grpc/test/bufconn"
 )
+
+// The runtime verifier and some CI sandboxes deny all sockets (loopback included), so the server is served on an
+// in-memory listener and every client dials it through the same listener.
 
 type recorder struct {
 	mu    sync.Mutex
@@ -40,7 +44,14 @@ func (r *recorder) snapshot() []string {
 
 func registerHealth(s *grpc.Server) { healthpb.RegisterHealthServer(s, health.NewServer()) }
 
-// registerHealthGateway exposes GET /healthz, which calls the gRPC health service through the endpoint the server dials.
+// healthGateway exposes GET /healthz, which calls the gRPC health service with the dial options the server passes. The
+// in-memory listener replaces the network address (dialAddress has its own test).
+func healthGateway(lis *bufconn.Listener) RegisterHTTPHandlerFunc {
+	return func(ctx context.Context, mux *runtime.ServeMux, endpoint string, opts []grpc.DialOption) error {
+		return registerHealthGateway(ctx, mux, "passthrough:///bufnet", append(opts, dialer(lis)))
+	}
+}
+
 func registerHealthGateway(ctx context.Context, mux *runtime.ServeMux, endpoint string, opts []grpc.DialOption) error {
 	conn, err := grpc.NewClient(endpoint, opts...)
 	if err != nil {
@@ -58,13 +69,10 @@ func registerHealthGateway(ctx context.Context, mux *runtime.ServeMux, endpoint 
 	})
 }
 
-// start serves s on a loopback port and stops it when the test ends, failing the test if Serve returns an error.
-func start(t *testing.T, s *Server) string {
+// start serves s on an in-memory listener and stops it when the test ends, failing the test if Serve returns an error.
+func start(t *testing.T, s *Server) *bufconn.Listener {
 	t.Helper()
-	lis, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	lis := bufconn.Listen(1 << 20)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- s.Serve(ctx, lis) }()
@@ -79,12 +87,20 @@ func start(t *testing.T, s *Server) string {
 			t.Error("Serve did not return after cancellation")
 		}
 	})
-	return lis.Addr().String()
+	return lis
 }
 
-func healthCheck(t *testing.T, addr string) error {
+func dialer(lis *bufconn.Listener) grpc.DialOption {
+	return grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) { return lis.DialContext(ctx) })
+}
+
+func httpClient(lis *bufconn.Listener) *http.Client {
+	return &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) { return lis.DialContext(ctx) }}}
+}
+
+func healthCheck(t *testing.T, lis *bufconn.Listener) error {
 	t.Helper()
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient("passthrough:///bufnet", grpc.WithTransportCredentials(insecure.NewCredentials()), dialer(lis))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,9 +114,9 @@ func healthCheck(t *testing.T, addr string) error {
 func TestCustomUnaryInterceptorsRunInRegistrationOrder(t *testing.T) {
 	rec := &recorder{}
 	s := New(WithGRPCUnaryInterceptor(rec.interceptor("first")), WithGRPCUnaryInterceptor(rec.interceptor("second"))).Register(registerHealth, nil)
-	addr := start(t, s)
+	lis := start(t, s)
 
-	if err := healthCheck(t, addr); err != nil {
+	if err := healthCheck(t, lis); err != nil {
 		t.Fatalf("health check: %v", err)
 	}
 	got := rec.snapshot()
@@ -114,9 +130,9 @@ func TestInterceptorCanRejectACall(t *testing.T) {
 	deny := func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 		return nil, status.Error(codes.PermissionDenied, "denied")
 	}
-	addr := start(t, New(WithGRPCUnaryInterceptor(deny)).Register(registerHealth, nil))
+	lis := start(t, New(WithGRPCUnaryInterceptor(deny)).Register(registerHealth, nil))
 
-	if code := status.Code(healthCheck(t, addr)); code != codes.PermissionDenied {
+	if code := status.Code(healthCheck(t, lis)); code != codes.PermissionDenied {
 		t.Fatalf("code = %v, want PermissionDenied", code)
 	}
 }
@@ -124,9 +140,9 @@ func TestInterceptorCanRejectACall(t *testing.T) {
 func TestServerOptionsAreApplied(t *testing.T) {
 	rec := &recorder{}
 	s := New(WithGRPCServerOptions(grpc.ChainUnaryInterceptor(rec.interceptor("option")))).Register(registerHealth, nil)
-	addr := start(t, s)
+	lis := start(t, s)
 
-	if err := healthCheck(t, addr); err != nil {
+	if err := healthCheck(t, lis); err != nil {
 		t.Fatalf("health check: %v", err)
 	}
 	if got := rec.snapshot(); len(got) != 1 {
@@ -136,9 +152,22 @@ func TestServerOptionsAreApplied(t *testing.T) {
 
 func TestGatewayCallsPassThroughInterceptors(t *testing.T) {
 	rec := &recorder{}
-	addr := start(t, New(WithGRPCUnaryInterceptor(rec.interceptor("gw"))).Register(registerHealth, registerHealthGateway))
+	var gw RegisterHTTPHandlerFunc
+	s := New(WithGRPCUnaryInterceptor(rec.interceptor("gw")))
+	lis := bufconn.Listen(1 << 20)
+	gw = healthGateway(lis)
+	s.Register(registerHealth, gw)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.Serve(ctx, lis) }()
+	defer func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Errorf("Serve: %v", err)
+		}
+	}()
 
-	resp, err := http.Get("http://" + addr + "/healthz")
+	resp, err := httpClient(lis).Get("http://bufnet/healthz")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,9 +186,9 @@ func TestHTTPMiddlewareAndMetricsEndpoint(t *testing.T) {
 	mw := func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { seen = true; next.ServeHTTP(w, r) })
 	}
-	addr := start(t, New(WithHTTPServerMiddleware(mw)).Register(registerHealth, nil))
+	lis := start(t, New(WithHTTPServerMiddleware(mw)).Register(registerHealth, nil))
 
-	resp, err := http.Get("http://" + addr + "/metrics")
+	resp, err := httpClient(lis).Get("http://bufnet/metrics")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,8 +199,8 @@ func TestHTTPMiddlewareAndMetricsEndpoint(t *testing.T) {
 }
 
 func TestServeWithoutRegistrationsAndNilRegisterFuncs(t *testing.T) {
-	addr := start(t, New())
-	if code := status.Code(healthCheck(t, addr)); code != codes.Unimplemented {
+	lis := start(t, New())
+	if code := status.Code(healthCheck(t, lis)); code != codes.Unimplemented {
 		t.Fatalf("code = %v, want Unimplemented for an unregistered service", code)
 	}
 }

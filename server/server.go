@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -87,12 +88,23 @@ func (s *Server) Serve(ctx context.Context, lis net.Listener) error {
 	grpcListener := m.MatchWithWriters(cmux.HTTP2MatchHeaderFieldSendSettings("content-type", "application/grpc"))
 	httpListener := m.Match(cmux.HTTP1Fast())
 
+	// Once shutdown has begun, the servers' exit errors are the expected result of closing them, whatever listener
+	// implementation produced them.
+	var shuttingDown atomic.Bool
+	exit := func(err error) error {
+		if shuttingDown.Load() || ignoreClosed(err) == nil {
+			return nil
+		}
+		return err
+	}
+
 	g, gctx := errgroup.WithContext(ctx)
-	g.Go(func() error { return ignoreClosed(grpcServer.Serve(grpcListener)) })
-	g.Go(func() error { return ignoreClosed(httpServer.Serve(httpListener)) })
-	g.Go(func() error { return ignoreClosed(m.Serve()) })
+	g.Go(func() error { return exit(grpcServer.Serve(grpcListener)) })
+	g.Go(func() error { return exit(httpServer.Serve(httpListener)) })
+	g.Go(func() error { return exit(m.Serve()) })
 	g.Go(func() error {
 		<-gctx.Done()
+		shuttingDown.Store(true)
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
 		stopped := make(chan struct{})
