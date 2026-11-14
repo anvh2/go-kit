@@ -2,24 +2,26 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"github.com/soheilhy/cmux"
-	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 )
 
-// RegisterGRPCHandlerFunc register server from
+// RegisterGRPCHandlerFunc registers gRPC services on the server.
 type RegisterGRPCHandlerFunc func(s *grpc.Server)
 
-// RegisterHTTPHandlerFunc ...
+// RegisterHTTPHandlerFunc registers grpc-gateway handlers that proxy to the gRPC endpoint.
 type RegisterHTTPHandlerFunc func(ctx context.Context, mux *runtime.ServeMux, endpoint string, opts []grpc.DialOption) (err error)
 
 // HTTPServerHandler ...
@@ -31,83 +33,115 @@ type HTTPServerMuxHandler func(*http.ServeMux)
 // HTTPServerMiddleware ...
 type HTTPServerMiddleware func(http.Handler) http.Handler
 
+// shutdownTimeout bounds graceful shutdown of the gRPC and HTTP servers.
+const shutdownTimeout = 10 * time.Second
+
+// stopGrace is how long Serve waits for handlers after forcing gRPC to stop.
+const stopGrace = time.Second
+
 type Server struct {
 	config *Config
 
-	server *struct {
-		grpc *grpc.Server
-		http *http.Server
-	}
-
-	register *struct {
+	register struct {
 		grpc RegisterGRPCHandlerFunc
 		http RegisterHTTPHandlerFunc
 	}
 }
 
 func New(opts ...Option) *Server {
-	config := evaluateOptions(opts)
-	return &Server{
-		config: config,
-		server: &struct {
-			grpc *grpc.Server
-			http *http.Server
-		}{},
-		register: &struct {
-			grpc RegisterGRPCHandlerFunc
-			http RegisterHTTPHandlerFunc
-		}{},
-	}
+	return &Server{config: evaluateOptions(opts)}
 }
 
+// Register sets the functions that register gRPC services and their HTTP gateway handlers. Either may be nil.
+func (s *Server) Register(grpcFn RegisterGRPCHandlerFunc, httpFn RegisterHTTPHandlerFunc) *Server {
+	s.register.grpc = grpcFn
+	s.register.http = httpFn
+	return s
+}
+
+// Start listens on the configured port and serves until SIGINT or SIGTERM, then runs the shutdown hooks.
 func (s *Server) Start() error {
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", s.config.port))
 	if err != nil {
 		return err
 	}
-
-	// catch sig
-	sigs := make(chan os.Signal, 1)
-	done := make(chan error, 1)
-	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-
-	ctx, cancel := context.WithCancel(context.Background())
-
-	go func() {
-		sig := <-sigs
-		fmt.Println("Exiting...: ", sig)
-
-		s.server.grpc.Stop()
-		s.server.http.Close()
-
-		cancel()
-		close(done)
-	}()
-
-	go s.serve(ctx, lis)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	fmt.Println("Server now listening at: " + lis.Addr().String())
-	fmt.Println("Ctrl-C to interrupt...")
-
-	err = <-done
+	err = s.Serve(ctx, lis)
 	for _, hook := range s.config.shutdownHooks {
 		hook()
 	}
-
-	fmt.Println("Shutted down.", zap.Error(err))
 	return err
 }
 
-// start listening grpc & http & exporter request
-func (s *Server) serve(ctx context.Context, listener net.Listener) {
-	m := cmux.New(listener)
+// Serve serves gRPC and HTTP (gateway, metrics, debug and custom handlers) on one listener until ctx is cancelled or a
+// server stops. On cancellation the HTTP server drains first (a gateway request already in flight still reaches gRPC
+// over its open connection; no new connections are accepted), then gRPC drains;
+// together they are bounded by shutdownTimeout, after which remaining connections are closed. Serve then returns nil.
+// If a server stops on its own (including because lis was closed by someone else), Serve shuts the other down and
+// returns that error. The listener is closed when Serve returns. Shutdown hooks are run by Start only.
+func (s *Server) Serve(ctx context.Context, lis net.Listener) error {
+	// Cancelled on every return, so the gateway's client connection to the gRPC server is always released.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	grpcServer := s.newGRPCServer()
+	httpServer, err := s.newHTTPServer(ctx, lis.Addr())
+	if err != nil {
+		lis.Close()
+		return err
+	}
+
+	m := cmux.New(lis)
+	// Without a read timeout, a connection that never sends its first bytes blocks cmux's protocol sniffing, and
+	// m.Serve (hence shutdown) would wait for it forever.
+	m.SetReadTimeout(s.config.muxReadTimeout)
 	grpcListener := m.MatchWithWriters(cmux.HTTP2MatchHeaderFieldSendSettings("content-type", "application/grpc"))
 	httpListener := m.Match(cmux.HTTP1Fast())
 
-	g := new(errgroup.Group)
-	g.Go(func() error { return s.grpcServe(ctx, grpcListener) })
-	g.Go(func() error { return s.httpServe(ctx, httpListener) })
-	g.Go(func() error { return m.Serve() })
+	// Once shutdown has begun, the servers' exit errors are the expected result of closing them, whatever listener
+	// implementation produced them. Before that, any exit is unexpected and ends Serve.
+	var shuttingDown atomic.Bool
+	exit := func(name string, err error) error {
+		if shuttingDown.Load() {
+			return nil
+		}
+		if err == nil {
+			err = errors.New("stopped")
+		}
+		return fmt.Errorf("server: %s: %w", name, err)
+	}
 
-	g.Wait()
+	g, gctx := errgroup.WithContext(ctx)
+	g.Go(func() error { return exit("grpc", grpcServer.Serve(grpcListener)) })
+	g.Go(func() error { return exit("http", httpServer.Serve(httpListener)) })
+	g.Go(func() error { return exit("mux", m.Serve()) })
+	g.Go(func() error {
+		<-gctx.Done()
+		shuttingDown.Store(true)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		if err := httpServer.Shutdown(shutdownCtx); err != nil {
+			httpServer.Close()
+		}
+		stopped := make(chan struct{})
+		go func() { grpcServer.GracefulStop(); close(stopped) }()
+		select {
+		case <-stopped:
+		case <-shutdownCtx.Done():
+			// Stop closes the connections but GracefulStop still waits for running handlers, and a handler that
+			// ignores its context never returns. Give it a short grace period, then leave it (its goroutine leaks)
+			// rather than keep Serve, and with it the shutdown hooks, from returning.
+			grpcServer.Stop()
+			select {
+			case <-stopped:
+			case <-time.After(stopGrace):
+			}
+		}
+		m.Close()
+		return nil
+	})
+	return g.Wait()
 }

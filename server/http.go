@@ -3,9 +3,9 @@ package server
 import (
 	"context"
 	"expvar"
-	"fmt"
 	"net"
 	"net/http"
+	"time"
 
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -19,8 +19,10 @@ const (
 	defaultDebugPath   = "/debug/vars"
 )
 
-// serve http request
-func (s *Server) httpServe(ctx context.Context, l net.Listener) error {
+// newHTTPServer builds the HTTP server: the grpc-gateway mux (dialing the gRPC server on the listener's own address),
+// metrics and debug endpoints, custom handlers and middlewares. /metrics and /debug/vars are served without
+// authentication on the same port; /debug/vars includes the process command line, so never pass secrets as flags.
+func (s *Server) newHTTPServer(ctx context.Context, addr net.Addr) (*http.Server, error) {
 	// configure mux options
 	muxOpts := []runtime.ServeMuxOption{
 		runtime.WithMarshalerOption(
@@ -41,11 +43,11 @@ func (s *Server) httpServe(ctx context.Context, l net.Listener) error {
 	mux := runtime.NewServeMux(muxOpts...)
 
 	// register handler
-	opts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
-	endPoint := fmt.Sprintf("0.0.0.0:%d", s.config.port)
-
-	if err := s.register.http(ctx, mux, endPoint, opts); err != nil {
-		return err
+	if s.register.http != nil {
+		opts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+		if err := s.register.http(ctx, mux, dialAddress(addr), opts); err != nil {
+			return nil, err
+		}
 	}
 
 	mux.HandlePath(http.MethodGet, defaultDebugPath, func(w http.ResponseWriter, r *http.Request, pathParams map[string]string) {
@@ -73,8 +75,18 @@ func (s *Server) httpServe(ctx context.Context, l net.Listener) error {
 		httpMux.Handle(path, middlewares(forwardMux))
 	}
 
-	s.server.http = &http.Server{
-		Handler: httpMux,
+	return &http.Server{Handler: httpMux, ReadHeaderTimeout: 10 * time.Second}, nil
+}
+
+// dialAddress is where the gateway reaches the gRPC server: the listener's own address, with an unspecified host
+// (0.0.0.0 or ::) replaced by loopback.
+func dialAddress(addr net.Addr) string {
+	host, port, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		return addr.String()
 	}
-	return s.server.http.Serve(l)
+	if ip := net.ParseIP(host); ip == nil || ip.IsUnspecified() {
+		host = "127.0.0.1"
+	}
+	return net.JoinHostPort(host, port)
 }
